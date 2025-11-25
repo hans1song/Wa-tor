@@ -1,4 +1,4 @@
-module Hans/Wa-tor
+module github.com/hans1song/Wa-tor
 
 go 1.14
 
