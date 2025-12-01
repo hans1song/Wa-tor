@@ -1,13 +1,17 @@
-// Command wator implements a Wa-Tor ecosystem simulation.
+// Package main implements a high-performance, concurrent simulation of the Wa-Tor
+// predator-prey model using the Ebiten game library.
 //
-// This simulation includes creature logic (Fish and Sharks), grid management,
-// parallel processing using Goroutines, and graphical visualization using the Ebiten library.
+// Author: Chengyan Song
 //
-// Usage:
+// Wa-Tor is a population dynamics simulation on a toroidal grid (wrapping edges).
+// It consists of two species: Fish and Sharks.
+//   - Fish move randomly and breed after a certain age.
+//   - Sharks move, hunt fish for energy, breed, and die if they run out of energy (starve).
 //
-//	wator [flags]
-//
-// The flags allow configuration of the world size, population counts, and reproduction rates.
+// The simulation uses a double-buffered grid system and employs concurrency for processing
+// by utilizing distinct horizontal strips processed by separate goroutines. Synchronization
+// is handled via sync.WaitGroup and atomic Compare-And-Swap (CAS) operations to
+// ensure thread-safe updates to the next state buffer without heavy mutex locking.
 package main
 
 import (
@@ -29,7 +33,8 @@ import (
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
 )
 
-// Direction constants for movement logic.
+// Direction constants representing the four cardinal directions.
+// Used for calculating adjacent coordinates.
 const (
 	NORTH = iota
 	SOUTH
@@ -37,91 +42,104 @@ const (
 	WEST
 )
 
-// coordinate represents a 2D coordinate on the grid.
+// coordinate represents a specific (x, y) position on the 2D world grid.
 type coordinate struct {
 	x, y int
 }
 
-// Simulation Configuration Flags.
+// Simulation Configuration Flags
+// These variables are populated via command-line arguments at runtime.
 var (
-	// nFish is the initial number of fish in the simulation.
-	nFish = flag.Int("fish", 3000, "Initial # of fish.")
+	// nFish sets the initial population of fish.
+	nFish = flag.Int("fish", 3000, "Initial number of fish.")
 
-	// nSharks is the initial number of sharks in the simulation.
-	nSharks = flag.Int("sharks", 2000, "Initial # of sharks.")
+	// nSharks sets the initial population of sharks.
+	nSharks = flag.Int("sharks", 2000, "Initial number of sharks.")
 
-	// fBreed is the number of chronons a fish must survive to reproduce.
-	fBreed = flag.Int("fbreed", 100, "# of cycles for fish to reproduce.")
+	// fBreed is the number of chronons (ticks) a fish must survive to reproduce.
+	fBreed = flag.Int("fbreed", 100, "Number of cycles required for a fish to reproduce.")
 
-	// sBreed is the number of chronons a shark must survive to reproduce.
-	sBreed = flag.Int("sbreed", 150, "# of cycles for shark to reproduce.")
+	// sBreed is the number of chronons (ticks) a shark must survive to reproduce.
+	sBreed = flag.Int("sbreed", 150, "Number of cycles required for a shark to reproduce.")
 
-	// starve is the number of chronons a shark can survive without eating.
-	starve = flag.Int("starve", 150, "# of cycles shark can go with feeding before dying.")
+	// starve is the initial energy level of a shark and the energy gained from eating a fish.
+	// If a shark's energy reaches 0, it dies.
+	starve = flag.Int("starve", 150, "Number of cycles a shark can survive without feeding before dying.")
 
-	// wwidth is the width of the toroidal world grid.
-	wwidth = flag.Int("width", 900, "Width of the world (East - West).")
+	// wwidth is the width of the toroidal world grid (East-West axis).
+	wwidth = flag.Int("width", 900, "Width of the world in cells.")
 
-	// wheight is the height of the toroidal world grid.
-	wheight = flag.Int("height", 600, "Height of the world (North-South).")
+	// wheight is the height of the toroidal world grid (North-South axis).
+	wheight = flag.Int("height", 600, "Height of the world in cells.")
 
-	// nThreads is the number of parallel threads (goroutines) to use for simulation updates.
-	nThreads = flag.Int("threads", runtime.NumCPU(), "Number of threads (goroutines) to use.")
+	// nThreads determines the number of concurrent goroutines used to update the world state.
+	// Defaults to the number of logical CPUs available.
+	nThreads = flag.Int("threads", runtime.NumCPU(), "Number of concurrent threads (goroutines) to use.")
 
-	// benchmark determines if the simulation runs in headless benchmark mode.
-	benchmark = flag.Bool("benchmark", false, "Run in benchmark mode (no graphics) for timing.")
+	// benchmark enables headless mode (no GUI) for performance testing.
+	benchmark = flag.Bool("benchmark", false, "Run in benchmark mode (no graphics) for timing analysis.")
 
-	// chronons is the total number of time steps to run in benchmark mode.
-	chronons = flag.Int("chronons", 2000, "Number of chronons to run in benchmark mode.")
+	// chronons defines the total simulation steps to execute when running in benchmark mode.
+	chronons = flag.Int("chronons", 2000, "Total number of chronons (time steps) to run in benchmark mode.")
 )
 
-// tick is the global tick counter for the simulation.
-var tick = 0
+// Global simulation state variables.
+var (
+	// tick tracks the current simulation step (chronon).
+	tick = 0
 
-// world is the double-buffered grid storage for the current state.
-var world [][]*creature
+	// world is the current state of the simulation grid.
+	// It is a read-only buffer during a specific update cycle.
+	world [][]*creature
 
-// nextWorld is the double-buffered grid storage for the next state.
-var nextWorld [][]*creature
+	// nextWorld is the future state of the simulation grid.
+	// It is the write buffer where updates are stored during a cycle.
+	nextWorld [][]*creature
+)
 
-// Creature Species Constants.
+// Species constants.
 const (
 	FISH = iota
 	SHARK
 )
 
-// Color definitions for rendering.
+// Rendering colors for grid entities.
 var (
 	fishcolor  = color.RGBA{0, 255, 0, 0} // Green
 	sharkcolor = color.RGBA{255, 0, 0, 0} // Red
-	watercolor = color.RGBA{0, 0, 0, 0}   // Black
+	watercolor = color.RGBA{0, 0, 0, 0}   // Transparent/Black
 )
 
-// creature represents a biological entity in the simulation (Fish or Shark).
+// creature represents a single entity (Agent) in the simulation.
+// It can be either a Fish or a Shark.
 type creature struct {
-	age     int        // Current age of the creature in chronons.
-	health  int        // Energy level (relevant for Sharks).
-	species int        // Species type: FISH or SHARK.
-	asset   color.RGBA // Color representation for the GUI.
-	chronon int        // Last chronon this creature was updated (to prevent double moves).
+	age     int        // The number of cycles the creature has lived.
+	health  int        // Energy level (only relevant for Sharks). Decreases over time, increases when eating.
+	species int        // The type of creature: FISH or SHARK.
+	asset   color.RGBA // The color used to render this creature.
+	chronon int        // The last tick index this creature was processed (prevents double updates).
 }
 
-// Chronon executes a single step (time step) of the simulation.
+// Chronon advances the simulation by a single unit of time.
 //
-// This function divides the grid into horizontal strips and assigns them to
-// parallel worker goroutines based on the configured thread count. It waits
-// for all workers to finish before swapping the grid buffers.
+// It implements a concurrent "fork-join" pattern:
+// 1. Partitioning: The world height is divided into horizontal strips based on *nThreads.
+// 2. Processing: Goroutines are spawned to process each strip (updateSlice).
+// 3. Synchronization: The main thread waits for all goroutines to finish via sync.WaitGroup.
+// 4. Swapping: The 'nextWorld' buffer becomes the 'world' buffer for the next frame.
 //
-// c is the current chronon index.
+// c represents the current tick index.
 func Chronon(c int) {
 	var wg sync.WaitGroup
 
 	numGoroutines := *nThreads
 
+	// Safety check for invalid thread counts.
 	if numGoroutines <= 0 {
 		numGoroutines = 1
 	}
 
+	// Ensure we don't have more threads than rows.
 	if numGoroutines > *wheight {
 		numGoroutines = *wheight
 	}
@@ -133,6 +151,7 @@ func Chronon(c int) {
 		startY := i * rowsPerGoroutine
 		endY := startY + rowsPerGoroutine
 
+		// Ensure the last routine covers any remaining rows due to integer division.
 		if i == numGoroutines-1 {
 			endY = *wheight
 		}
@@ -141,11 +160,14 @@ func Chronon(c int) {
 		go updateSlice(c, startY, endY, &wg)
 	}
 
+	// Wait for all slice updates to complete.
 	wg.Wait()
 
 	// Swap double buffers.
+	// The fully populated nextWorld becomes the read-only world for the next frame.
 	world, nextWorld = nextWorld, world
 
+	// Reset the new write buffer (nextWorld) to nil pointers.
 	for i := range nextWorld {
 		for j := range nextWorld[i] {
 			nextWorld[i][j] = nil
@@ -153,15 +175,21 @@ func Chronon(c int) {
 	}
 }
 
-// updateSlice updates a specific horizontal slice of the world grid.
+// updateSlice processes the logic for a horizontal strip of the world.
 //
-// It handles the movement, feeding, and reproduction logic for all creatures
-// within the specified Y-coordinate range (startY inclusive, endY exclusive).
-// It uses atomic operations to safely write to the nextWorld grid.
+// It iterates through the assigned rows (startY to endY) and applies the Wa-Tor rules:
+//   - Fish: Move randomly, breed if age > fBreed.
+//   - Shark: Lose energy, hunt fish, move randomly if no food, breed if age > sBreed, die if health <= 0.
+//
+// Concurrency Safety:
+// Since creatures moving near the boundary of a slice might attempt to write to the same
+// cell in 'nextWorld' as a neighbor thread, this function uses atomic.CompareAndSwapPointer
+// to safely claim a target cell.
 func updateSlice(c, startY, endY int, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	// Initialize a unique random seed for this goroutine.
+	// Initialize a thread-local random number generator.
+	// Using the global rand.Intn would require a mutex lock, slowing down concurrent execution.
 	var seed int64
 	var b [8]byte
 	_, err := crand.Read(b[:])
@@ -177,11 +205,13 @@ func updateSlice(c, startY, endY int, wg *sync.WaitGroup) {
 	for y := startY; y < endY; y++ {
 		for x := 0; x < *wwidth; x++ {
 
+			// Skip empty cells.
 			if world[x][y] == nil {
 				continue
 			}
 
-			// Copy creature data to avoid read conflicts.
+			// Copy the creature struct to a local variable.
+			// We modify the copy before attempting to place it in the next world.
 			cr := *world[x][y]
 			cr.age++
 			cr.chronon = c
@@ -190,10 +220,12 @@ func updateSlice(c, startY, endY int, wg *sync.WaitGroup) {
 
 			switch cr.species {
 			case FISH:
-				// Fish behavior: Move randomly to an empty adjacent spot.
+				// --- FISH BEHAVIOR ---
+				// Try to move to a random adjacent empty spot.
 				for i := 0; i < 4; i++ {
 					north, south, east, west := adjacent(x, y)
 					d := r.Intn(4)
+					// Randomize direction check order
 					switch (d + i) % 4 {
 					case NORTH:
 						newX, newY = north.x, north.y
@@ -205,13 +237,18 @@ func updateSlice(c, startY, endY int, wg *sync.WaitGroup) {
 						newX, newY = west.x, west.y
 					}
 
+					// Check if target spot in the current world is empty.
+					// Note: Wa-Tor usually checks the *current* world for emptiness.
 					if world[newX][newY] == nil {
-						// Use atomic CAS to claim the spot in the next world state.
+						// Atomic CAS: Try to write the fish to the nextWorld slot.
+						// If nextWorld[newX][newY] is not nil, another thread (or this one) already filled it.
 						if atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&nextWorld[newX][newY])), nil, unsafe.Pointer(&cr)) {
 							moved = true
-							// Reproduce if old enough.
+							// Breeding logic: Leave a new baby fish in the old spot.
 							if cr.age > 0 && cr.age%*fBreed == 0 {
 								babyFish := &creature{age: 0, species: FISH, asset: fishcolor, chronon: c}
+								// We don't strictly need CAS here if we assume only one thing leaves a square,
+								// but it's safer for correctness.
 								atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&nextWorld[x][y])), nil, unsafe.Pointer(babyFish))
 							}
 							break
@@ -219,18 +256,21 @@ func updateSlice(c, startY, endY int, wg *sync.WaitGroup) {
 					}
 				}
 
+				// If the fish couldn't move, it stays in the same spot.
 				if !moved {
 					atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&nextWorld[x][y])), nil, unsafe.Pointer(&cr))
 				}
 
 			case SHARK:
-				// Shark behavior: Starve if health is depleted.
+				// --- SHARK BEHAVIOR ---
+				// 1. Metabolism: Lose energy.
 				cr.health--
 				if cr.health <= 0 {
+					// Shark dies (we simply do not add it to nextWorld).
 					continue
 				}
 
-				// Priority 1: Hunt for adjacent fish.
+				// 2. Hunting: Try to find a fish in adjacent cells.
 				for i := 0; i < 4; i++ {
 					north, south, east, west := adjacent(x, y)
 					d := r.Intn(4)
@@ -245,11 +285,15 @@ func updateSlice(c, startY, endY int, wg *sync.WaitGroup) {
 						newX, newY = west.x, west.y
 					}
 
+					// If an adjacent cell has a fish, eat it.
 					if world[newX][newY] != nil && world[newX][newY].species == FISH {
-						cr.health = *starve
+						cr.health = *starve // Reset energy after eating.
+
+						// Try to move into the fish's spot (effectively eating it in the next frame).
+						// Note: This simulation logic assumes "first shark to claim the spot gets the fish".
 						if atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&nextWorld[newX][newY])), nil, unsafe.Pointer(&cr)) {
 							moved = true
-							// Reproduce if old enough (split energy).
+							// Breeding logic
 							if cr.age > 0 && cr.age%*sBreed == 0 {
 								childEnergy := cr.health / 2
 								cr.health -= childEnergy
@@ -266,7 +310,7 @@ func updateSlice(c, startY, endY int, wg *sync.WaitGroup) {
 					continue
 				}
 
-				// Priority 2: Move to an empty adjacent square if no fish found.
+				// 3. Movement: If no fish found, move to a random empty spot.
 				for i := 0; i < 4; i++ {
 					north, south, east, west := adjacent(x, y)
 					d := r.Intn(4)
@@ -284,6 +328,7 @@ func updateSlice(c, startY, endY int, wg *sync.WaitGroup) {
 					if world[newX][newY] == nil {
 						if atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&nextWorld[newX][newY])), nil, unsafe.Pointer(&cr)) {
 							moved = true
+							// Breeding logic (even if just moving)
 							if cr.age > 0 && cr.age%*sBreed == 0 {
 								childEnergy := cr.health / 2
 								cr.health -= childEnergy
@@ -296,6 +341,7 @@ func updateSlice(c, startY, endY int, wg *sync.WaitGroup) {
 					}
 				}
 
+				// If the shark couldn't move or hunt, it stays in place.
 				if !moved {
 					atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&nextWorld[x][y])), nil, unsafe.Pointer(&cr))
 				}
@@ -304,8 +350,11 @@ func updateSlice(c, startY, endY int, wg *sync.WaitGroup) {
 	}
 }
 
-// adjacent calculates adjacent coordinates wrapping around the toroidal world.
-// It returns the north, south, east, and west coordinates relative to (x, y).
+// adjacent calculates the coordinates of the four neighbors of (x, y).
+//
+// It implements toroidal wrapping, meaning coordinates wrap around the edges of the grid:
+// - Moving off the right edge (East) puts you at x=0.
+// - Moving off the top edge (North) puts you at the bottom.
 func adjacent(x, y int) (coordinate, coordinate, coordinate, coordinate) {
 	var n, s, e, w coordinate
 	if y == 0 {
@@ -336,11 +385,11 @@ func adjacent(x, y int) (coordinate, coordinate, coordinate, coordinate) {
 	return n, s, e, w
 }
 
-// initWator initializes the simulation world.
+// initWator prepares the initial state of the simulation.
 //
-// It allocates memory for the grid and randomly populates it with the specified
-// number of fish and sharks. It returns two grids: the initial world state and
-// the empty 'next' state buffer.
+// It allocates the 2D slices for 'world' and 'nextWorld' and randomly populates
+// 'world' with the requested number of Fish and Sharks at random locations.
+// It ensures no two creatures occupy the same starting cell.
 func initWator() ([][]*creature, [][]*creature) {
 
 	var wm = make([][]*creature, *wwidth)
@@ -355,6 +404,7 @@ func initWator() ([][]*creature, [][]*creature) {
 	pop := 0
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 
+	// Populate Fish
 	for i := 0; i < *nFish; i++ {
 		for {
 			if pop == *wwidth**wheight {
@@ -375,6 +425,7 @@ func initWator() ([][]*creature, [][]*creature) {
 		}
 	}
 
+	// Populate Sharks
 	for i := 0; i < *nSharks; i++ {
 		for {
 			if pop == *wwidth**wheight {
@@ -399,7 +450,8 @@ func initWator() ([][]*creature, [][]*creature) {
 	return wm, nwm
 }
 
-// debug helps to print the grid to console (unused in production).
+// debug prints a text representation of the grid to stdout.
+// Used primarily for verification during development, not in the GUI loop.
 func debug() {
 	for y := 0; y < *wheight; y++ {
 		for x := 0; x < *wwidth; x++ {
@@ -418,17 +470,20 @@ func debug() {
 	}
 }
 
-// Game is a struct implementing the Ebiten interface.
+// Game implements the ebiten.Game interface.
 type Game struct{}
 
-// Update updates the game state. It is called every frame (tick).
+// Update proceeds the game state.
+// It is called every tick (usually 60 times per second by default in Ebiten).
+// See: https://pkg.go.dev/github.com/hajimehoshi/ebiten/v2#Game
 func (g *Game) Update() error {
 	tick++
 	Chronon(tick)
 	return nil
 }
 
-// Draw draws the current game state to the screen.
+// Draw renders the game screen.
+// It iterates over the world grid and sets pixels based on the creature type.
 func (g *Game) Draw(screen *ebiten.Image) {
 	screen.Fill(watercolor)
 	for x := 0; x < *wwidth; x++ {
@@ -443,24 +498,27 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	ebitenutil.DebugPrint(screen, strconv.Itoa(tick))
 }
 
-// Layout defines the screen layout.
-// It returns the internal logical screen dimensions.
+// Layout accepts the outside window dimensions and returns the logical game screen size.
+// Here, the logical size matches the simulation grid size exactly.
 func (g *Game) Layout(outsideWidth, outsideHeight int) (screenWidth, screenHeight int) {
 	return *wwidth, *wheight
 }
 
-// main is the entry point.
+// main is the application entry point.
 //
-// It parses flags, initializes the simulation, and starts either the benchmark
-// or the graphical loop.
+// It parses command-line flags and initializes the simulation.
+// Based on the 'benchmark' flag, it either:
+// 1. Runs a headless simulation for performance timing.
+// 2. Starts the interactive Ebiten GUI window.
 func main() {
 	flag.Parse()
 
+	// Ensure the grid is large enough for the initial population.
 	if *nFish+*nSharks > *wwidth**wheight {
 		log.Fatal("Not enough space for Fish and Shark!")
 	}
 
-	// Set process limits for accurate benchmarking and parallel execution.
+	// Set GOMAXPROCS to match the thread count for optimal concurrent execution.
 	runtime.GOMAXPROCS(*nThreads)
 
 	if *benchmark {
